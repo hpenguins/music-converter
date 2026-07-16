@@ -1,19 +1,48 @@
-# README
+# NCM Converter
 
-## About
+Convert NCM files to standard audio formats (MP3, FLAC, OGG, M4A, WAV).
 
-This is the official Wails React-TS template.
+## Features
 
-You can configure the project by editing `wails.json`. More information about the project settings can be found
-here: https://wails.io/docs/reference/project-config
+- Select NCM files via file dialog or drag-and-drop
+- Decrypt multiple files in batch with progress indication
+- Choose output directory (defaults to Downloads folder)
+- Click a completed file to preview its metadata and album cover
+- Supports MP3, FLAC, OGG, M4A, WAV output (auto-detected)
 
-## Live Development
+## Usage
 
-To run in live development mode, run `wails dev` in the project directory. This will run a Vite development
-server that will provide very fast hot reload of your frontend changes. If you want to develop in a browser
-and have access to your Go methods, there is also a dev server that runs on http://localhost:34115. Connect
-to this in your browser, and you can call your Go code from devtools.
+1. Click "Select NCM Files" or drag `.ncm` files onto the window
+2. Choose an output directory (or keep the default Downloads folder)
+3. Click "Start Decrypt"
+4. Click any successfully decrypted row to view details
 
-## Building
+## Build
 
-To build a redistributable, production mode package, use `wails build`.
+```bash
+git clone <repo-url>
+cd music-converter
+
+# Install frontend dependencies
+cd frontend && npm install && cd ..
+
+# Development mode (hot reload)
+wails dev
+
+# Production build
+wails build
+```
+
+The executable will be at `build/bin/music-converter.exe`.
+
+## Requirements
+
+- Go 1.23+
+- Node.js 16+
+- Wails CLI v2 (`go install github.com/wailsapp/wails/v2/cmd/wails@latest`)
+
+## Tech Stack
+
+- **Backend**: Go + Wails v2
+- **Frontend**: React 18 + TypeScript + Vite
+- **Cryptography**: AES-128-ECB (Go standard library)

@@ -1,9 +1,16 @@
-import {useState, useCallback, useEffect} from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import './App.css';
-import {SelectNCMFiles, SelectOutputDir, GetDefaultOutputDir, DecryptFiles, GetCoverAsBase64} from "../wailsjs/go/main/App";
-import {EventsOn, EventsOff} from "../wailsjs/runtime";
+import {
+  SelectNCMFiles, SelectOutputDir, GetDefaultOutputDir,
+  ConvertFiles, GetCoverAsBase64, GetSettings, SaveSettings,
+} from "../wailsjs/go/main/App";
+import { EventsOn, EventsOff } from "../wailsjs/runtime";
 
-// ==================== 类型定义 ====================
+// ======================== Types ========================
+
+interface AppSettings {
+  saveCoverFile: boolean;
+}
 
 interface FileItem {
   path: string;
@@ -11,24 +18,23 @@ interface FileItem {
   size: number;
 }
 
-interface DecryptStatus {
+interface OutputItem {
   fileName: string;
-  filePath: string;
-  status: string; // "processing" | "success" | "error"
-  output?: string;
-  error?: string;
-  title?: string;
-  artist?: string;
-  album?: string;
-  format?: string;
-  coverPath?: string;
+  inputPath: string;
+  output: string;
+  title: string;
+  artist: string;
+  album: string;
+  format: string;
+  coverPath: string;
+  coverDataUrl: string;
 }
 
 interface ProgressEvent {
   current: number;
   total: number;
   fileName: string;
-  status: string;
+  status: string; // "decrypting" | "transcoding" | "success" | "error"
   error?: string;
   output?: string;
   title?: string;
@@ -36,424 +42,420 @@ interface ProgressEvent {
   album?: string;
   format?: string;
   coverPath?: string;
+  transPct?: number;
 }
 
-interface DetailInfo {
-  fileName: string;
-  filePath: string;
-  title: string;
-  artist: string;
-  album: string;
-  format: string;
-  output: string;
-  coverPath: string;
-  coverDataUrl: string;
-}
+const FORMATS = ['auto', 'mp3', 'flac', 'ogg', 'wav'] as const;
+type AudioFormat = typeof FORMATS[number];
 
-// ==================== 工具函数 ====================
-
-function formatFileSize(bytes: number): string {
+function formatSize(bytes: number): string {
   if (bytes === 0) return '0 B';
   const k = 1024;
-  const sizes = ['B', 'KB', 'MB', 'GB'];
   const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + ['B', 'KB', 'MB', 'GB'][i];
 }
 
-function StatusIcon({status}: { status?: string }) {
-  switch (status) {
-    case 'processing':
-      return <span className="status-icon processing">⏳</span>;
-    case 'success':
-      return <span className="status-icon success">✓</span>;
-    case 'error':
-      return <span className="status-icon error">✗</span>;
-    default:
-      return <span className="status-icon idle">♪</span>;
-  }
+function extname(p: string): string {
+  const i = p.lastIndexOf('.');
+  return i >= 0 ? p.slice(i).toLowerCase() : '';
 }
 
-// ==================== 主组件 ====================
+function basename(p: string): string {
+  const parts = p.replace(/\\/g, '/').split('/');
+  return parts[parts.length - 1] || p;
+}
+
+function removeExt(name: string): string {
+  const i = name.lastIndexOf('.');
+  return i >= 0 ? name.slice(0, i) : name;
+}
+
+// ======================== App ========================
 
 function App() {
-  const [files, setFiles] = useState<FileItem[]>([]);
+  // --- state ---
+  const [inputs, setInputs] = useState<FileItem[]>([]);
+  const [formatMap, setFormatMap] = useState<Map<string, AudioFormat>>(new Map());
+  const [outputs, setOutputs] = useState<OutputItem[]>([]);
   const [outputDir, setOutputDir] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
-  const [decryptResults, setDecryptResults] = useState<Map<string, DecryptStatus>>(new Map());
+  const [progress, setProgress] = useState({ current: 0, total: 0 });
   const [dragOver, setDragOver] = useState(false);
-  const [overallProgress, setOverallProgress] = useState({current: 0, total: 0});
-  const [detailInfo, setDetailInfo] = useState<DetailInfo | null>(null);
+  const [selectedOutput, setSelectedOutput] = useState<OutputItem | null>(null);
   const [coverLoading, setCoverLoading] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const [settings, setSettings] = useState<AppSettings>({ saveCoverFile: true });
 
-  // ========== 监听 Wails 进度事件 ==========
+  // --- load settings ---
   useEffect(() => {
-    const handler = (data: ProgressEvent) => {
-      setOverallProgress({current: data.current, total: data.total});
-      setDecryptResults(prev => {
-        const next = new Map(prev);
-        next.set(data.fileName, {
-          fileName: data.fileName,
-          filePath: '',
-          status: data.status,
-          output: data.output,
-          error: data.error,
-          title: data.title,
-          artist: data.artist,
-          album: data.album,
-          format: data.format,
-          coverPath: data.coverPath,
-        });
-        return next;
-      });
-    };
-
-    EventsOn('decrypt:progress', handler);
-    return () => { EventsOff('decrypt:progress'); };
+    GetSettings().then(s => { if (s) setSettings(s); });
   }, []);
 
-  // ========== 监听 Wails 拖拽事件 ==========
+  // --- events ---
   useEffect(() => {
-    const dropHandler = (filePaths: string[]) => {
-      if (!filePaths || filePaths.length === 0) return;
-      const ncmFiles = filePaths
-        .filter((p: string) => p.toLowerCase().endsWith('.ncm'))
-        .map((p: string) => {
-          const parts = p.replace(/\\/g, '/').split('/');
-          return {
-            path: p,
-            name: parts[parts.length - 1] || p,
-            size: 0,
-          };
+    const h = (d: ProgressEvent) => {
+      setProgress({ current: d.current, total: d.total });
+
+      if (d.status === 'success' && d.output) {
+        const item: OutputItem = {
+          fileName: basename(d.output),
+          inputPath: '',
+          output: d.output,
+          title: d.title || '',
+          artist: d.artist || '',
+          album: d.album || '',
+          format: d.format || '',
+          coverPath: d.coverPath || '',
+          coverDataUrl: '',
+        };
+        // 从 inputs 找原始路径
+        const input = inputs.find(f => f.name === d.fileName);
+        if (input) item.inputPath = input.path;
+
+        setOutputs(prev => {
+          if (prev.find(o => o.output === d.output)) return prev;
+          return [...prev, item];
         });
+
+        // 从 inputs 移除已完成文件
+        setInputs(prev => prev.filter(f => f.name !== d.fileName));
+        setFormatMap(prev => { const m = new Map(prev); m.delete(d.fileName); return m; });
+      }
+
+      if (d.status === 'error') {
+        // 出错的留在左侧，更新状态显示
+      }
+    };
+    EventsOn('convert:progress', h);
+    return () => { EventsOff('convert:progress'); };
+  }, [inputs]);
+
+  // drag-drop
+  useEffect(() => {
+    const h = (paths: string[]) => {
+      if (!paths || paths.length === 0) return;
+      const ncmFiles = paths
+        .filter((p: string) => p.toLowerCase().endsWith('.ncm'))
+        .map((p: string) => ({ path: p, name: basename(p), size: 0 }));
       if (ncmFiles.length === 0) return;
-      setFiles(prev => {
-        const existing = new Set(prev.map(f => f.path));
-        const fresh = ncmFiles.filter(f => !existing.has(f.path));
+      setInputs(prev => {
+        const exist = new Set(prev.map(f => f.path));
+        const fresh = ncmFiles.filter(f => !exist.has(f.path));
         return [...prev, ...fresh];
       });
     };
-
-    EventsOn('wails:dragdrop', dropHandler);
+    EventsOn('wails:dragdrop', h);
     return () => { EventsOff('wails:dragdrop'); };
   }, []);
 
-  // ========== 初始化输出目录 ==========
+  // default output dir
   useEffect(() => {
-    GetDefaultOutputDir().then(dir => {
-      if (dir) setOutputDir(dir);
-    });
+    GetDefaultOutputDir().then(d => { if (d) setOutputDir(d); });
   }, []);
 
-  // ========== 操作处理 ==========
+  // --- toggle cover file setting ---
+  const toggleCoverFile = useCallback(async () => {
+    const next = { ...settings, saveCoverFile: !settings.saveCoverFile };
+    setSettings(next);
+    try { await SaveSettings(next); } catch { /* ignore */ }
+  }, [settings]);
 
-  const handleSelectFiles = useCallback(async () => {
+  // --- handlers ---
+  const addFiles = useCallback(async () => {
     if (isProcessing) return;
     try {
-      const selected = await SelectNCMFiles();
-      if (selected && selected.length > 0) {
-        setFiles(prev => {
-          const existing = new Set(prev.map(f => f.path));
-          const fresh = selected.filter(f => !existing.has(f.path));
-          return [...prev, ...fresh];
-        });
-      }
-    } catch { /* user cancelled */ }
+      const sel = await SelectNCMFiles();
+      if (!sel || sel.length === 0) return;
+      setInputs(prev => {
+        const exist = new Set(prev.map(f => f.path));
+        const fresh = sel.filter(f => !exist.has(f.path));
+        return [...prev, ...fresh];
+      });
+    } catch { /* ignore */ }
   }, [isProcessing]);
 
-  const handleSelectOutputDir = useCallback(async () => {
+  const pickOutputDir = useCallback(async () => {
     if (isProcessing) return;
     try {
-      const dir = await SelectOutputDir();
-      if (dir) setOutputDir(dir);
-    } catch { /* user cancelled */ }
+      const d = await SelectOutputDir();
+      if (d) setOutputDir(d);
+    } catch { /* ignore */ }
   }, [isProcessing]);
 
-  const handleRemoveFile = useCallback((path: string) => {
+  const removeInput = useCallback((path: string) => {
     if (isProcessing) return;
-    const file = files.find(f => f.path === path);
-    setFiles(prev => prev.filter(f => f.path !== path));
-    if (file) {
-      setDecryptResults(prev => { const n = new Map(prev); n.delete(file.name); return n; });
-    }
-    if (detailInfo && file && detailInfo.fileName === file.name) {
-      setDetailInfo(null);
-    }
-  }, [isProcessing, files, detailInfo]);
+    const f = inputs.find(i => i.path === path);
+    setInputs(prev => prev.filter(i => i.path !== path));
+    if (f) setFormatMap(prev => { const m = new Map(prev); m.delete(f.name); return m; });
+  }, [isProcessing, inputs]);
 
-  const handleClearFiles = useCallback(() => {
+  const clearInputs = useCallback(() => {
     if (isProcessing) return;
-    setFiles([]);
-    setDecryptResults(new Map());
-    setOverallProgress({current: 0, total: 0});
-    setDetailInfo(null);
+    setInputs([]);
+    setFormatMap(new Map());
   }, [isProcessing]);
 
-  const handleDecrypt = useCallback(async () => {
-    if (isProcessing || files.length === 0 || !outputDir) return;
+  const clearOutputs = useCallback(() => {
+    setOutputs([]);
+    setSelectedOutput(null);
+  }, []);
+
+  const setFileFormat = useCallback((fileName: string, fmt: AudioFormat) => {
+    setFormatMap(prev => { const m = new Map(prev); m.set(fileName, fmt); return m; });
+  }, []);
+
+  // --- convert ---
+  const startConvert = useCallback(async () => {
+    if (isProcessing || inputs.length === 0 || !outputDir) return;
     setIsProcessing(true);
-    setDecryptResults(new Map());
-    setOverallProgress({current: 0, total: files.length});
-    setDetailInfo(null);
+    setOutputs([]);
+    setSelectedOutput(null);
+    setProgress({ current: 0, total: inputs.length });
+
+    const requests = inputs.map(f => ({
+      path: f.path,
+      format: formatMap.get(f.name) || 'auto',
+    }));
+
     try {
-      await DecryptFiles(files.map(f => f.path), outputDir);
+      await ConvertFiles(requests, outputDir);
     } catch (err) {
       console.error(err);
     } finally {
       setIsProcessing(false);
     }
-  }, [isProcessing, files, outputDir]);
+  }, [isProcessing, inputs, outputDir, formatMap]);
 
-  // ========== 文件行点击 → 查看详情 ==========
-  const handleRowClick = useCallback(async (file: FileItem) => {
-    const st = decryptResults.get(file.name);
-    if (!st || st.status !== 'success') return;
-
+  // --- click output item for detail ---
+  const showDetail = useCallback(async (item: OutputItem) => {
     setCoverLoading(true);
-
-    let coverDataUrl = '';
-    if (st.coverPath) {
-      try {
-        coverDataUrl = await GetCoverAsBase64(st.coverPath);
-      } catch { /* ignore */ }
+    let cover = '';
+    if (item.coverPath) {
+      try { cover = await GetCoverAsBase64(item.coverPath); } catch { /* ignore */ }
     }
-
-    setDetailInfo({
-      fileName: st.fileName || file.name,
-      filePath: file.path,
-      title: st.title || '',
-      artist: st.artist || '',
-      album: st.album || '',
-      format: st.format || '',
-      output: st.output || '',
-      coverPath: st.coverPath || '',
-      coverDataUrl,
-    });
+    setSelectedOutput({ ...item, coverDataUrl: cover });
     setCoverLoading(false);
-  }, [decryptResults]);
-
-  const handleCloseDetail = useCallback(() => {
-    setDetailInfo(null);
   }, []);
 
-  // ========== 统计数据 ==========
-  const successCount = Array.from(decryptResults.values()).filter(r => r.status === 'success').length;
-  const errorCount = Array.from(decryptResults.values()).filter(r => r.status === 'error').length;
-  const processingCount = Array.from(decryptResults.values()).filter(r => r.status === 'processing').length;
-  const pct = overallProgress.total > 0
-    ? Math.round((overallProgress.current / overallProgress.total) * 100)
-    : 0;
+  // --- stats ---
+  const pct = progress.total > 0 ? Math.round((progress.current / progress.total) * 100) : 0;
+  const processingName = isProcessing && progress.total > 0
+    ? (() => {
+        const idx = Math.min(progress.current, inputs.length - 1);
+        return idx >= 0 ? inputs[idx]?.name : '';
+      })()
+    : '';
 
   return (
     <div id="App">
-      {/* ========== 标题栏 ========== */}
+      {/* ====== Header ====== */}
       <header className="app-header">
-        <div className="header-icon">🎵</div>
-        <div>
-          <h1 className="app-title">NCM 音乐解密工具</h1>
-          <p className="app-subtitle">网易云音乐 .ncm 文件 → 通用音频格式</p>
+        <div className="header-icon">NCM Converter</div>
+        <div className="header-toolbar">
+          <button className="btn btn-primary" onClick={addFiles} disabled={isProcessing}>
+            Select Files
+          </button>
+          <div className="output-dir">
+            <span className="dir-label">Output:</span>
+            <span className="dir-path" title={outputDir}>{outputDir || '(not set)'}</span>
+            <button className="btn btn-small" onClick={pickOutputDir} disabled={isProcessing}>Browse</button>
+          </div>
+          <button className="btn btn-icon" onClick={() => setShowSettings(!showSettings)} title="Settings">
+            &#9881;
+          </button>
         </div>
       </header>
 
-      <div className="app-body">
-        {/* ========== 主区域 ========== */}
-        <main className={`app-main ${detailInfo ? 'with-detail' : ''}`}>
-          {/* 工具栏 */}
-          <div className="toolbar">
-            <div className="toolbar-row">
-              <button className="btn btn-primary" onClick={handleSelectFiles} disabled={isProcessing}>
-                📂 选择 NCM 文件
+      {/* ====== Settings panel ====== */}
+      {showSettings && (
+        <div className="settings-bar">
+          <label className="settings-item">
+            <span className="settings-label">Save cover files</span>
+            <span className="settings-desc">Write cover images as separate .jpg files alongside audio output</span>
+            <div className="toggle-wrapper">
+              <input type="checkbox" className="toggle-input" id="saveCover"
+                checked={settings.saveCoverFile}
+                onChange={toggleCoverFile}
+              />
+              <label className="toggle-track" htmlFor="saveCover">
+                <span className="toggle-knob" />
+              </label>
+            </div>
+          </label>
+        </div>
+      )}
+
+      {/* ====== Body ====== */}
+      <div className="app-body"
+        onDragOver={e => { e.preventDefault(); setDragOver(true); }}
+        onDragLeave={e => { e.preventDefault(); setDragOver(false); }}
+        onDrop={e => { e.preventDefault(); setDragOver(false); }}
+      >
+        {/* ====== Left panel: inputs ====== */}
+        <section className={`panel panel-left ${dragOver ? 'drag-over' : ''}`}>
+          <div className="panel-header">
+            <h2 className="panel-title">Files to Process</h2>
+            <span className="panel-count">{inputs.length}</span>
+          </div>
+
+          {inputs.length === 0 ? (
+            <div className="panel-placeholder">
+              <p>Drop <code>.ncm</code> files here</p>
+              <p className="hint">or click Select Files above</p>
+            </div>
+          ) : (
+            <div className="panel-list">
+              {inputs.map(f => (
+                <div key={f.path} className="input-row">
+                  <div className="input-row-info">
+                    <span className="file-name">{f.name}</span>
+                    <span className="file-size">{f.size > 0 ? formatSize(f.size) : ''}</span>
+                  </div>
+                  <div className="input-row-actions">
+                    <select
+                      className="format-select"
+                      value={formatMap.get(f.name) || 'auto'}
+                      onChange={e => setFileFormat(f.name, e.target.value as AudioFormat)}
+                      disabled={isProcessing}
+                    >
+                      {FORMATS.map(fmt => (
+                        <option key={fmt} value={fmt}>{fmt.toUpperCase()}</option>
+                      ))}
+                    </select>
+                    <button
+                      className="btn-icon"
+                      onClick={() => removeInput(f.path)}
+                      disabled={isProcessing}
+                      title="Remove"
+                    >&times;</button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {inputs.length > 0 && (
+            <div className="panel-footer">
+              <button className="btn btn-ghost btn-small" onClick={clearInputs} disabled={isProcessing}>
+                Clear All
               </button>
-              <div className="output-dir">
-                <label className="dir-label">输出目录:</label>
-                <span className="dir-path" title={outputDir}>
-                  {outputDir || '未选择'}
-                </span>
-                <button className="btn btn-small" onClick={handleSelectOutputDir} disabled={isProcessing}>
-                  浏览...
-                </button>
-              </div>
             </div>
-          </div>
+          )}
+        </section>
 
-          {/* 文件列表 / 拖拽区 */}
-          <div
-            className={`drop-zone ${dragOver ? 'drag-over' : ''} ${files.length > 0 ? 'has-files' : ''}`}
-            onDragOver={e => { e.preventDefault(); setDragOver(true); }}
-            onDragLeave={e => { e.preventDefault(); setDragOver(false); }}
-            onDrop={e => { e.preventDefault(); setDragOver(false); }}
+        {/* ====== Center: convert button ====== */}
+        <section className="panel-center">
+          <button
+            className={`btn-convert ${isProcessing ? 'processing' : ''}`}
+            onClick={startConvert}
+            disabled={isProcessing || inputs.length === 0 || !outputDir}
           >
-            {files.length === 0 ? (
-              <div className="drop-placeholder">
-                <div className="drop-icon">📁</div>
-                <p className="drop-text">拖拽 NCM 文件到此处</p>
-                <p className="drop-hint">或点击上方「选择 NCM 文件」按钮</p>
-              </div>
-            ) : (
-              <div className="file-table-wrapper">
-                <table className="file-table">
-                  <thead>
-                    <tr>
-                      <th className="col-status"></th>
-                      <th className="col-name">文件名</th>
-                      <th className="col-size">大小</th>
-                      <th className="col-result">状态</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {files.map(file => {
-                      const st = decryptResults.get(file.name);
-                      return (
-                        <tr
-                          key={file.path}
-                          className={`file-row ${st?.status || ''} ${st?.status === 'success' ? 'clickable' : ''}`}
-                          onClick={() => st?.status === 'success' && handleRowClick(file)}
-                          title={st?.status === 'success' ? '点击查看详情' : undefined}
-                        >
-                          <td className="col-status"><StatusIcon status={st?.status} /></td>
-                          <td className="col-name">
-                            <span className="file-name">{file.name}</span>
-                            {st?.title && (
-                              <span className="file-meta">
-                                {st.title}{st.artist ? ` — ${st.artist}` : ''}
-                              </span>
-                            )}
-                          </td>
-                          <td className="col-size">{formatFileSize(file.size)}</td>
-                          <td className="col-result">
-                            {!st && <span className="result-pending">等待解密</span>}
-                            {st?.status === 'processing' && <span className="result-processing">解密中...</span>}
-                            {st?.status === 'success' && <span className="result-success">✓ {st.format?.toUpperCase() || '成功'}</span>}
-                            {st?.status === 'error' && (
-                              <span className="result-error" title={st.error}>
-                                ✗ {st.error && (st.error.substring(0, 24) + (st.error.length > 24 ? '…' : ''))}
-                              </span>
-                            )}
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
+            <span className="convert-arrow">{isProcessing ? '' : '▶'}</span>
+            <span>{isProcessing ? 'Converting...' : 'Start Convert'}</span>
+          </button>
 
-                <div className="file-list-footer">
-                  <button className="btn btn-ghost" onClick={handleClearFiles} disabled={isProcessing}>
-                    清空列表
-                  </button>
-                  <div className="footer-right">
-                    {processingCount > 0 && <span className="processing-hint">解密中 {overallProgress.current}/{overallProgress.total}</span>}
-                    {successCount > 0 && <span className="success-count">✓ 成功 {successCount}</span>}
-                    {errorCount > 0 && <span className="error-count">✗ 失败 {errorCount}</span>}
-                  </div>
-                </div>
+          {isProcessing && (
+            <div className="center-progress">
+              <div className="progress-bar-vert">
+                <div className="progress-fill-vert" style={{ height: `${pct}%` }} />
               </div>
-            )}
+              <span className="progress-label">{pct}%</span>
+              <span className="progress-detail">{progress.current} / {progress.total}</span>
+            </div>
+          )}
+        </section>
+
+        {/* ====== Right panel: outputs ====== */}
+        <section className="panel panel-right">
+          <div className="panel-header">
+            <h2 className="panel-title">Completed</h2>
+            <span className="panel-count">{outputs.length}</span>
           </div>
 
-          {/* 操作栏 */}
-          <div className="action-bar">
-            {overallProgress.total > 0 && (
-              <div className="progress-wrapper">
-                <div className="progress-bar">
-                  <div className="progress-fill" style={{width: `${pct}%`}} />
-                </div>
-                <span className="progress-text">
-                  {processingCount > 0
-                    ? `正在解密 ${overallProgress.current}/${overallProgress.total}`
-                    : pct >= 100 ? '解密完成' : `${pct}%`}
-                </span>
-              </div>
-            )}
-            <button
-              className={`btn btn-large ${isProcessing ? 'btn-disabled' : 'btn-primary'}`}
-              onClick={handleDecrypt}
-              disabled={isProcessing || files.length === 0 || !outputDir}
-            >
-              {isProcessing ? '解密中...' : '开始解密'}
-            </button>
-          </div>
-        </main>
-
-        {/* ========== 详情面板 ========== */}
-        {detailInfo && (
-          <aside className="detail-panel">
-            <div className="detail-header">
-              <h2 className="detail-title">歌曲详情</h2>
-              <button className="btn-close" onClick={handleCloseDetail} title="关闭">✕</button>
+          {outputs.length === 0 ? (
+            <div className="panel-placeholder">
+              <p>{isProcessing ? 'Converting...' : 'No files converted yet'}</p>
             </div>
-
-            <div className="detail-body">
-              {/* 封面图片 */}
-              <div className="cover-section">
-                {coverLoading ? (
-                  <div className="cover-placeholder">加载中...</div>
-                ) : detailInfo.coverDataUrl ? (
-                  <img
-                    className="cover-image"
-                    src={detailInfo.coverDataUrl}
-                    alt={`${detailInfo.title} 封面`}
-                  />
-                ) : (
-                  <div className="cover-placeholder">
-                    <span className="cover-placeholder-icon">🎵</span>
-                    <span>无封面</span>
+          ) : (
+            <div className="panel-list">
+              {outputs.map(o => (
+                <div
+                  key={o.output}
+                  className={`output-row ${selectedOutput?.output === o.output ? 'active' : ''}`}
+                  onClick={() => showDetail(o)}
+                >
+                  <div className="output-row-icon">&#10003;</div>
+                  <div className="output-row-info">
+                    <span className="file-name">{basename(o.output)}</span>
+                    {(o.title || o.artist) && (
+                      <span className="file-meta">
+                        {o.title}{o.artist ? ' — ' + o.artist : ''}
+                      </span>
+                    )}
                   </div>
-                )}
-              </div>
-
-              {/* 元数据 */}
-              <div className="meta-section">
-                <div className="meta-item">
-                  <span className="meta-label">歌曲</span>
-                  <span className="meta-value">{detailInfo.title || '未知'}</span>
+                  <span className="output-format">{o.format.toUpperCase()}</span>
                 </div>
-                <div className="meta-item">
-                  <span className="meta-label">歌手</span>
-                  <span className="meta-value">{detailInfo.artist || '未知'}</span>
-                </div>
-                <div className="meta-item">
-                  <span className="meta-label">专辑</span>
-                  <span className="meta-value">{detailInfo.album || '未知'}</span>
-                </div>
-                <div className="meta-item">
-                  <span className="meta-label">格式</span>
-                  <span className="meta-value format-badge">{detailInfo.format.toUpperCase()}</span>
-                </div>
-              </div>
-
-              {/* 文件信息 */}
-              <div className="file-section">
-                <h3 className="section-title">输出文件</h3>
-                <div className="meta-item">
-                  <span className="meta-label">文件名</span>
-                  <span className="meta-value file-path" title={detailInfo.output}>
-                    {detailInfo.output.split('\\').pop()?.split('/').pop() || detailInfo.output}
-                  </span>
-                </div>
-                <div className="meta-item">
-                  <span className="meta-label">路径</span>
-                  <span className="meta-value file-path" title={detailInfo.output}>
-                    {detailInfo.output}
-                  </span>
-                </div>
-                {detailInfo.coverPath && (
-                  <div className="meta-item">
-                    <span className="meta-label">封面</span>
-                    <span className="meta-value file-path" title={detailInfo.coverPath}>
-                      {detailInfo.coverPath.split('\\').pop()?.split('/').pop()}
-                    </span>
-                  </div>
-                )}
-              </div>
+              ))}
             </div>
-          </aside>
-        )}
+          )}
+
+          {outputs.length > 0 && (
+            <div className="panel-footer">
+              <button className="btn btn-ghost btn-small" onClick={clearOutputs}>
+                Clear All
+              </button>
+            </div>
+          )}
+        </section>
       </div>
 
-      {/* ========== 底部状态栏 ========== */}
+      {/* ====== Detail bar ====== */}
+      {selectedOutput && (
+        <div className="detail-bar">
+          <div className="detail-inner">
+            <div className="detail-cover">
+              {coverLoading ? (
+                <div className="cover-ph loading">Loading...</div>
+              ) : selectedOutput.coverDataUrl ? (
+                <img className="cover-ph" src={selectedOutput.coverDataUrl} alt="cover" />
+              ) : (
+                <div className="cover-ph empty">No Cover</div>
+              )}
+            </div>
+            <div className="detail-meta">
+              <div className="detail-field">
+                <span className="detail-label">Title</span>
+                <span className="detail-value">{selectedOutput.title || '(unknown)'}</span>
+              </div>
+              <div className="detail-field">
+                <span className="detail-label">Artist</span>
+                <span className="detail-value">{selectedOutput.artist || '(unknown)'}</span>
+              </div>
+              <div className="detail-field">
+                <span className="detail-label">Album</span>
+                <span className="detail-value">{selectedOutput.album || '(unknown)'}</span>
+              </div>
+              <div className="detail-field">
+                <span className="detail-label">Format</span>
+                <span className="detail-value fmt">{selectedOutput.format.toUpperCase()}</span>
+              </div>
+              <div className="detail-field file-info">
+                <span className="detail-label">File</span>
+                <span className="detail-value path" title={selectedOutput.output}>
+                  {basename(selectedOutput.output)}
+                </span>
+              </div>
+            </div>
+            <button className="btn-close-detail" onClick={() => setSelectedOutput(null)}>&times;</button>
+          </div>
+        </div>
+      )}
+
+      {/* ====== Footer ====== */}
       <footer className="app-footer">
-        <span>支持拖拽 .ncm 文件到窗口</span>
-        <span>成功文件点击查看详情</span>
-        <span className="footer-dir" title={outputDir}>输出: {outputDir}</span>
+        <span>Drop .ncm files onto the window</span>
+        {processingName && <span className="now-processing">Now: {processingName}</span>}
+        <span className="footer-dir" title={outputDir}>{outputDir}</span>
       </footer>
     </div>
   );

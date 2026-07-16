@@ -3,22 +3,63 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
+	"music-converter/ffmpeg"
 )
+
+// AppSettings 用户设置
+type AppSettings struct {
+	SaveCoverFile bool `json:"saveCoverFile"`
+}
 
 // App struct
 type App struct {
-	ctx context.Context
+	ctx      context.Context
+	settings AppSettings
+}
+
+// settingsPath 返回设置文件的路径
+func settingsPath() string {
+	dir := filepath.Join(os.Getenv("APPDATA"), "ncm-converter")
+	os.MkdirAll(dir, 0755)
+	return filepath.Join(dir, "settings.json")
+}
+
+// loadSettings 从磁盘加载设置
+func loadSettings() AppSettings {
+	s := AppSettings{SaveCoverFile: true} // 默认值
+	data, err := os.ReadFile(settingsPath())
+	if err != nil {
+		return s
+	}
+	json.Unmarshal(data, &s)
+	if data == nil {
+		s.SaveCoverFile = true
+	}
+	return s
+}
+
+// saveSettings 保存设置到磁盘
+func saveSettings(s AppSettings) error {
+	data, err := json.MarshalIndent(s, "", "  ")
+	if err != nil {
+		return fmt.Errorf("序列化设置失败: %w", err)
+	}
+	return os.WriteFile(settingsPath(), data, 0644)
 }
 
 // NewApp creates a new App application struct
 func NewApp() *App {
-	return &App{}
+	return &App{
+		settings: loadSettings(),
+	}
 }
 
 // startup 应用启动时调用
@@ -30,9 +71,19 @@ func (a *App) startup(ctx context.Context) {
 		if len(paths) == 0 {
 			return
 		}
-		// 将拖拽的文件路径通过事件发送给前端
 		runtime.EventsEmit(ctx, "wails:dragdrop", paths)
 	})
+}
+
+// GetSettings 返回当前设置
+func (a *App) GetSettings() AppSettings {
+	return a.settings
+}
+
+// SaveSettings 保存设置
+func (a *App) SaveSettings(s AppSettings) error {
+	a.settings = s
+	return saveSettings(s)
 }
 
 // FileInfo 文件信息
@@ -47,7 +98,7 @@ type FileInfo struct {
 type DecryptStatus struct {
 	FileName  string `json:"fileName"`
 	FilePath  string `json:"filePath"`
-	Status    string `json:"status"` // "pending", "processing", "success", "error"
+	Status    string `json:"status"`
 	Progress  int    `json:"progress"`
 	Output    string `json:"output,omitempty"`
 	Error     string `json:"error,omitempty"`
@@ -58,14 +109,32 @@ type DecryptStatus struct {
 	CoverPath string `json:"coverPath,omitempty"`
 }
 
-// SelectNCMFiles 打开文件选择对话框，仅选择 .ncm 文件
+// FileConvertRequest 文件转换请求
+type FileConvertRequest struct {
+	Path   string `json:"path"`
+	Format string `json:"format"` // "auto", "mp3", "flac", "ogg", "wav"
+}
+
+// SelectNCMFiles 打开文件选择对话框，支持常见音频格式
 func (a *App) SelectNCMFiles() ([]FileInfo, error) {
 	files, err := runtime.OpenMultipleFilesDialog(a.ctx, runtime.OpenDialogOptions{
-		Title: "选择 NCM 文件",
+		Title: "选择音频文件",
 		Filters: []runtime.FileFilter{
 			{
-				DisplayName: "网易云音乐文件 (*.ncm)",
+				DisplayName: "所有支持的格式",
+				Pattern:     "*.ncm;*.mp3;*.flac;*.ogg;*.wav;*.m4a;*.wma;*.aac;*.opus",
+			},
+			{
+				DisplayName: "NCM 文件 (*.ncm)",
 				Pattern:     "*.ncm",
+			},
+			{
+				DisplayName: "音频文件 (*.mp3;*.flac;*.ogg;*.wav;*.m4a)",
+				Pattern:     "*.mp3;*.flac;*.ogg;*.wav;*.m4a",
+			},
+			{
+				DisplayName: "所有文件 (*.*)",
+				Pattern:     "*",
 			},
 		},
 	})
@@ -85,12 +154,7 @@ func (a *App) SelectNCMFiles() ([]FileInfo, error) {
 			Size: info.Size(),
 		})
 	}
-
-	// 排序：按文件名
-	sort.Slice(result, func(i, j int) bool {
-		return result[i].Name < result[j].Name
-	})
-
+	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
 	return result, nil
 }
 
@@ -140,100 +204,208 @@ func (a *App) GetCoverAsBase64(coverPath string) string {
 	return "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(data)
 }
 
+// isNCM 判断是否为 NCM 文件
+func isNCM(path string) bool {
+	return strings.ToLower(filepath.Ext(path)) == ".ncm"
+}
 
-// DecryptFiles 批量解密 NCM 文件
-func (a *App) DecryptFiles(files []string, outputDir string) ([]DecryptStatus, error) {
-	if len(files) == 0 {
+// audioExt 支持的音频扩展名列表
+var audioExts = []string{".ncm", ".mp3", ".flac", ".ogg", ".wav", ".m4a", ".wma", ".aac", ".opus"}
+
+// isSupportedAudio 判断是否为支持的音频文件
+func isSupportedAudio(path string) bool {
+	ext := strings.ToLower(filepath.Ext(path))
+	for _, e := range audioExts {
+		if ext == e {
+			return true
+		}
+	}
+	return false
+}
+
+// ConvertFiles 批量转换（NCM 解密 + 通用音频转码）
+func (a *App) ConvertFiles(requests []FileConvertRequest, outputDir string) ([]DecryptStatus, error) {
+	if len(requests) == 0 {
 		return nil, fmt.Errorf("没有选择文件")
 	}
-
-	// 确保输出目录存在
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
 		return nil, fmt.Errorf("创建输出目录失败: %w", err)
 	}
 
-	results := make([]DecryptStatus, len(files))
+	results := make([]DecryptStatus, len(requests))
+	total := len(requests)
 
-	for i, filePath := range files {
+	for i, req := range requests {
+		filePath := req.Path
 		fileName := filepath.Base(filePath)
-		results[i] = DecryptStatus{
-			FileName: fileName,
-			FilePath: filePath,
-			Status:   "processing",
+		targetFormat := strings.ToLower(req.Format)
+
+		// 确定输出格式
+		if targetFormat == "" || targetFormat == "auto" {
+			// auto 模式：NCM 用解密检测的格式，其他保留原格式
+			if isNCM(filePath) {
+				targetFormat = "detect" // 后面解密后确定
+			} else {
+				ext := strings.TrimPrefix(strings.ToLower(filepath.Ext(filePath)), ".")
+				if ext == "m4a" || ext == "wma" || ext == "aac" || ext == "opus" {
+					targetFormat = "mp3" // 这类默认转 MP3
+				} else {
+					targetFormat = ext // 保持原格式 = 不转码
+				}
+			}
 		}
 
-		// 发送进度事件
-		runtime.EventsEmit(a.ctx, "decrypt:progress", map[string]interface{}{
-			"current":  i,
-			"total":    len(files),
-			"fileName": fileName,
-			"status":   "processing",
-		})
+		results[i] = DecryptStatus{FileName: fileName, FilePath: filePath, Status: "processing"}
 
-		// 解密
-		result, audioData, err := DecryptToBuffer(filePath)
-		if err != nil {
-			results[i].Status = "error"
-			results[i].Error = err.Error()
-
-			runtime.EventsEmit(a.ctx, "decrypt:progress", map[string]interface{}{
-				"current":  i + 1,
-				"total":    len(files),
-				"fileName": fileName,
-				"status":   "error",
-				"error":    err.Error(),
-			})
-			continue
+		if isNCM(filePath) {
+			// ===== NCM 路径：解密 + 可选转码 =====
+			err := a.convertNCM(i, total, req, targetFormat, outputDir, &results[i])
+			if err != nil {
+				results[i].Status = "error"
+				results[i].Error = err.Error()
+			}
+		} else {
+			// ===== 普通音频路径：直接 ffmpeg 转码 =====
+			err := a.convertAudio(i, total, req, targetFormat, outputDir, &results[i])
+			if err != nil {
+				results[i].Status = "error"
+				results[i].Error = err.Error()
+			}
 		}
 
-		// 生成输出文件名
-		outName := fileName[:len(fileName)-4] + "." + result.Format
-		outPath := filepath.Join(outputDir, outName)
-
-		// 写入音频文件
-		if err := WriteAudioFile(outPath, audioData); err != nil {
-			results[i].Status = "error"
-			results[i].Error = fmt.Sprintf("写入文件失败: %v", err)
-
-			runtime.EventsEmit(a.ctx, "decrypt:progress", map[string]interface{}{
-				"current":  i + 1,
-				"total":    len(files),
-				"fileName": fileName,
-				"status":   "error",
-				"error":    err.Error(),
-			})
-			continue
-		}
-
-		// 写入封面图片
-		coverPath := ""
-		if result.CoverData != nil {
-			coverPath = WriteCoverFile(result.CoverData, outPath)
-		}
-
-		results[i].Status = "success"
-		results[i].Output = outPath
-		results[i].Title = result.Title
-		results[i].Artist = result.Artist
-		results[i].Album = result.Album
-		results[i].Format = result.Format
-		results[i].CoverPath = coverPath
-
-		runtime.EventsEmit(a.ctx, "decrypt:progress", map[string]interface{}{
+		// 发送最终事件
+		runtime.EventsEmit(a.ctx, "convert:progress", map[string]interface{}{
 			"current":   i + 1,
-			"total":     len(files),
+			"total":     total,
 			"fileName":  fileName,
-			"status":    "success",
-			"output":    outPath,
-			"title":     result.Title,
-			"artist":    result.Artist,
-			"album":     result.Album,
-			"format":    result.Format,
-			"coverPath": coverPath,
+			"status":    results[i].Status,
+			"error":     results[i].Error,
+			"output":    results[i].Output,
+			"title":     results[i].Title,
+			"artist":    results[i].Artist,
+			"format":    results[i].Format,
+			"coverPath": results[i].CoverPath,
 		})
 	}
 
 	return results, nil
+}
+
+// convertNCM 处理 NCM 文件：解密 + 可选 ffmpeg 转码
+func (a *App) convertNCM(idx, total int, req FileConvertRequest, targetFormat, outputDir string, status *DecryptStatus) error {
+	filePath := req.Path
+	fileName := filepath.Base(filePath)
+
+	runtime.EventsEmit(a.ctx, "convert:progress", map[string]interface{}{
+		"current": idx, "total": total, "fileName": fileName, "status": "decrypting",
+	})
+
+	// 解密
+	result, audioData, err := DecryptToBuffer(filePath)
+	if err != nil {
+		return fmt.Errorf("解密失败: %w", err)
+	}
+
+	// auto 检测模式下使用解密检测到的格式
+	if targetFormat == "detect" {
+		targetFormat = result.Format
+	}
+
+	needTranscode := targetFormat != result.Format
+	baseName := strings.TrimSuffix(fileName, filepath.Ext(fileName))
+	outName := baseName + "." + targetFormat
+	outPath := filepath.Join(outputDir, outName)
+
+	if needTranscode {
+		// 写临时文件
+		tmpDir := filepath.Join(os.TempDir(), "ncm-converter")
+		os.MkdirAll(tmpDir, 0755)
+		tmpFile := filepath.Join(tmpDir, baseName+"."+result.Format)
+		if err := os.WriteFile(tmpFile, audioData, 0644); err != nil {
+			return fmt.Errorf("写临时文件失败: %w", err)
+		}
+		EmbedMetadata(tmpFile, result.Title, result.Artist, result.Album, result.CoverData)
+
+		// 转码
+		runtime.EventsEmit(a.ctx, "convert:progress", map[string]interface{}{
+			"current": idx, "total": total, "fileName": fileName, "status": "transcoding",
+		})
+		tErr := ffmpeg.Transcode(tmpFile, outPath, targetFormat, func(pct float64) {
+			runtime.EventsEmit(a.ctx, "convert:progress", map[string]interface{}{
+				"current": idx, "total": total, "fileName": fileName, "status": "transcoding", "transPct": pct,
+			})
+		})
+		os.Remove(tmpFile)
+		if tErr != nil {
+			return fmt.Errorf("转码失败: %w", tErr)
+		}
+
+		// 重新嵌入元数据
+		EmbedMetadata(outPath, result.Title, result.Artist, result.Album, result.CoverData)
+	} else {
+		// 直接写
+		if err := WriteAudioFile(outPath, audioData); err != nil {
+			return fmt.Errorf("写入文件失败: %w", err)
+		}
+		EmbedMetadata(outPath, result.Title, result.Artist, result.Album, result.CoverData)
+	}
+
+	// 封面
+	coverPath := ""
+	if a.settings.SaveCoverFile && result.CoverData != nil {
+		coverPath = WriteCoverFile(result.CoverData, outPath)
+	}
+
+	status.Status = "success"
+	status.Output = outPath
+	status.Title = result.Title
+	status.Artist = result.Artist
+	status.Album = result.Album
+	status.Format = targetFormat
+	status.CoverPath = coverPath
+	return nil
+}
+
+// convertAudio 处理普通音频文件：直接 ffmpeg 转码
+func (a *App) convertAudio(idx, total int, req FileConvertRequest, targetFormat, outputDir string, status *DecryptStatus) error {
+	filePath := req.Path
+	fileName := filepath.Base(filePath)
+
+	runtime.EventsEmit(a.ctx, "convert:progress", map[string]interface{}{
+		"current": idx, "total": total, "fileName": fileName, "status": "transcoding",
+	})
+
+	baseName := strings.TrimSuffix(fileName, filepath.Ext(fileName))
+	outName := baseName + "." + targetFormat
+	outPath := filepath.Join(outputDir, outName)
+
+	// 源格式 == 目标格式 → 直接复制（不转码）
+	srcExt := strings.TrimPrefix(strings.ToLower(filepath.Ext(filePath)), ".")
+	if srcExt == targetFormat {
+		inputData, err := os.ReadFile(filePath)
+		if err != nil {
+			return fmt.Errorf("读取文件失败: %w", err)
+		}
+		if err := WriteAudioFile(outPath, inputData); err != nil {
+			return fmt.Errorf("写入文件失败: %w", err)
+		}
+	} else {
+		// ffmpeg 转码（保留源文件元数据）
+		tErr := ffmpeg.Transcode(filePath, outPath, targetFormat, func(pct float64) {
+			runtime.EventsEmit(a.ctx, "convert:progress", map[string]interface{}{
+				"current": idx, "total": total, "fileName": fileName, "status": "transcoding", "transPct": pct,
+			})
+		})
+		if tErr != nil {
+			return fmt.Errorf("转码失败: %w", tErr)
+		}
+	}
+
+	status.Status = "success"
+	status.Output = outPath
+	status.Title = strings.TrimSuffix(fileName, filepath.Ext(fileName))
+	status.Format = targetFormat
+	return nil
 }
 
 // GetFileSize 获取文件大小（友好格式）

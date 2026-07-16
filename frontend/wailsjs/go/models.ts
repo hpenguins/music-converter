@@ -1,5 +1,17 @@
 export namespace main {
 	
+	export class AppSettings {
+	    saveCoverFile: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new AppSettings(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.saveCoverFile = source["saveCoverFile"];
+	    }
+	}
 	export class DecryptStatus {
 	    fileName: string;
 	    filePath: string;
@@ -30,6 +42,20 @@ export namespace main {
 	        this.album = source["album"];
 	        this.format = source["format"];
 	        this.coverPath = source["coverPath"];
+	    }
+	}
+	export class FileConvertRequest {
+	    path: string;
+	    format: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new FileConvertRequest(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.path = source["path"];
+	        this.format = source["format"];
 	    }
 	}
 	export class FileInfo {

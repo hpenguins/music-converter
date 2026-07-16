@@ -339,3 +339,115 @@ func WriteCoverFile(coverData []byte, audioPath string) string {
 	}
 	return coverPath
 }
+
+// synchsafe 将 32 位整数编码为 ID3v2 的 synchsafe 整数（每字节只用 7 位）
+func synchsafe(n int) []byte {
+	return []byte{
+		byte((n >> 21) & 0x7F),
+		byte((n >> 14) & 0x7F),
+		byte((n >> 7) & 0x7F),
+		byte(n & 0x7F),
+	}
+}
+
+// embedID3v2 为 MP3 文件写入 ID3v2.3 标签（含专辑封面）
+// 读取整个文件 → 剥离已有 ID3v2 标签 → 写入新标签头+帧 → 追加纯音频数据
+func embedID3v2(audioPath string, title, artist, album string, coverData []byte) error {
+	// 1. 读取整个文件
+	allData, err := os.ReadFile(audioPath)
+	if err != nil {
+		return err
+	}
+
+	// 2. 剥离已有 ID3v2 标签（前 10 字节头 + synchsafe 字段声明的尺寸）
+	dataOffset := 0
+	if len(allData) > 10 && string(allData[:3]) == "ID3" {
+		size := int(allData[6])<<21 | int(allData[7])<<14 | int(allData[8])<<7 | int(allData[9])
+		tagEnd := 10 + size
+		if tagEnd > 0 && tagEnd <= len(allData) {
+			dataOffset = tagEnd
+		}
+	}
+	rawAudio := allData[dataOffset:]
+
+	// 3. 构建帧列表
+	type id3Frame struct {
+		id   string
+		data []byte
+	}
+
+	encText := func(s string) []byte {
+		d := []byte{0x03} // UTF-8 编码字节
+		d = append(d, []byte(s)...)
+		return d
+	}
+
+	var frames []id3Frame
+
+	if title != "" {
+		frames = append(frames, id3Frame{"TIT2", encText(title)})
+	}
+	if artist != "" {
+		frames = append(frames, id3Frame{"TPE1", encText(artist)})
+	}
+	if album != "" {
+		frames = append(frames, id3Frame{"TALB", encText(album)})
+	}
+	if coverData != nil {
+		// APIC 帧: encoding(1) + mime(N + \0) + picType(1) + desc(\0) + data
+		apic := []byte{0x03} // UTF-8
+		apic = append(apic, []byte("image/jpeg")...)
+		apic = append(apic, 0x00) // null terminator
+		apic = append(apic, 0x03) // front cover
+		apic = append(apic, 0x00) // empty description
+		apic = append(apic, coverData...)
+		frames = append(frames, id3Frame{"APIC", apic})
+	}
+
+	if len(frames) == 0 {
+		return nil // 无标签可写，不修改文件
+	}
+
+	// 4. 计算 ID3v2 标签总大小（帧头 10 + 帧数据）
+	frameSize := 0
+	for _, fr := range frames {
+		frameSize += 10 + len(fr.data)
+	}
+
+	// 5. 构建 ID3v2 头: "ID3" + ver(3,0) + flags(0) + synchsafe size
+	tagHeader := []byte("ID3")
+	tagHeader = append(tagHeader, 0x03, 0x00) // v2.3
+	tagHeader = append(tagHeader, 0x00)       // flags
+	tagHeader = append(tagHeader, synchsafe(frameSize)...)
+
+	// 6. 构建完整标签帧
+	var tagFrames []byte
+	for _, fr := range frames {
+		// 帧头: id(4) + size(4) + flags(2)
+		fh := []byte(fr.id)
+		fh = append(fh, byte(len(fr.data)>>24), byte(len(fr.data)>>16), byte(len(fr.data)>>8), byte(len(fr.data)))
+		fh = append(fh, 0x00, 0x00) // no flags
+		tagFrames = append(tagFrames, fh...)
+		tagFrames = append(tagFrames, fr.data...)
+	}
+
+	// 7. 以截断方式写回文件：标签头 + 帧数据 + 纯音频
+	out := append(tagHeader, tagFrames...)
+	out = append(out, rawAudio...)
+	return os.WriteFile(audioPath, out, 0644)
+}
+
+// EmbedMetadata 将元数据和封面内嵌到音频文件中
+func EmbedMetadata(audioPath, title, artist, album string, coverData []byte) error {
+	ext := strings.ToLower(filepath.Ext(audioPath))
+	switch ext {
+	case ".mp3":
+		return embedID3v2(audioPath, title, artist, album, coverData)
+	case ".flac":
+		// FLAC 元数据块嵌入较复杂，暂用外部文件替代
+		// 可后续扩展
+		return nil
+	default:
+		return nil
+	}
+}
