@@ -1,0 +1,13 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "music-converter",
+  "outputfilename": "music-converter",
+  "frontend:install": "pnpm install",
+  "frontend:build": "pnpm run build",
+  "frontend:dev:watcher": "nppm run dev",
+  "frontend:dev:serverUrl": "auto",
+  "author": {
+    "name": "hpenguins",
+    "email": ""
+  }
+}
