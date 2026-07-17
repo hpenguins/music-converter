@@ -182,6 +182,11 @@ func (a *App) GetDefaultOutputDir() string {
 	return home
 }
 
+// CheckFFmpeg 返回 ffmpeg 是否可用
+func (a *App) CheckFFmpeg() bool {
+	return ffmpeg.IsAvailable()
+}
+
 // GetCoverAsBase64 读取封面图片并返回 Base64 数据 URI
 func (a *App) GetCoverAsBase64(coverPath string) string {
 	if coverPath == "" {

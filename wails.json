@@ -1,7 +1,7 @@
 {
   "$schema": "https://wails.io/schemas/config.v2.json",
-  "name": "music-converter",
-  "outputfilename": "music-converter",
+  "name": "audio-converter",
+  "outputfilename": "audio-converter",
   "frontend:install": "pnpm install",
   "frontend:build": "pnpm run build",
   "frontend:dev:watcher": "pnpm run dev",

@@ -2,7 +2,7 @@ import { useState, useCallback, useEffect } from 'react';
 import './App.css';
 import {
   SelectNCMFiles, SelectOutputDir, GetDefaultOutputDir,
-  ConvertFiles, GetCoverAsBase64, GetSettings, SaveSettings,
+  ConvertFiles, GetCoverAsBase64, GetSettings, SaveSettings, CheckFFmpeg,
 } from "../wailsjs/go/main/App";
 import { EventsOn, EventsOff } from "../wailsjs/runtime";
 
@@ -55,19 +55,9 @@ function formatSize(bytes: number): string {
   return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + ['B', 'KB', 'MB', 'GB'][i];
 }
 
-function extname(p: string): string {
-  const i = p.lastIndexOf('.');
-  return i >= 0 ? p.slice(i).toLowerCase() : '';
-}
-
 function basename(p: string): string {
   const parts = p.replace(/\\/g, '/').split('/');
   return parts[parts.length - 1] || p;
-}
-
-function removeExt(name: string): string {
-  const i = name.lastIndexOf('.');
-  return i >= 0 ? name.slice(0, i) : name;
 }
 
 // ======================== App ========================
@@ -85,10 +75,12 @@ function App() {
   const [coverLoading, setCoverLoading] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [settings, setSettings] = useState<AppSettings>({ saveCoverFile: true });
+  const [ffmpegAvail, setFfmpegAvail] = useState(true);
 
-  // --- load settings ---
+  // --- load settings & check ffmpeg ---
   useEffect(() => {
     GetSettings().then(s => { if (s) setSettings(s); });
+    CheckFFmpeg().then(ok => setFfmpegAvail(ok));
   }, []);
 
   // --- events ---
@@ -108,7 +100,6 @@ function App() {
           coverPath: d.coverPath || '',
           coverDataUrl: '',
         };
-        // 从 inputs 找原始路径
         const input = inputs.find(f => f.name === d.fileName);
         if (input) item.inputPath = input.path;
 
@@ -117,13 +108,8 @@ function App() {
           return [...prev, item];
         });
 
-        // 从 inputs 移除已完成文件
         setInputs(prev => prev.filter(f => f.name !== d.fileName));
         setFormatMap(prev => { const m = new Map(prev); m.delete(d.fileName); return m; });
-      }
-
-      if (d.status === 'error') {
-        // 出错的留在左侧，更新状态显示
       }
     };
     EventsOn('convert:progress', h);
@@ -134,13 +120,16 @@ function App() {
   useEffect(() => {
     const h = (paths: string[]) => {
       if (!paths || paths.length === 0) return;
-      const ncmFiles = paths
-        .filter((p: string) => p.toLowerCase().endsWith('.ncm'))
+      const audioFiles = paths
+        .filter((p: string) => {
+          const ext = p.toLowerCase().slice(p.lastIndexOf('.'));
+          return ['.ncm', '.mp3', '.flac', '.ogg', '.wav', '.m4a', '.wma', '.aac', '.opus'].includes(ext);
+        })
         .map((p: string) => ({ path: p, name: basename(p), size: 0 }));
-      if (ncmFiles.length === 0) return;
+      if (audioFiles.length === 0) return;
       setInputs(prev => {
         const exist = new Set(prev.map(f => f.path));
-        const fresh = ncmFiles.filter(f => !exist.has(f.path));
+        const fresh = audioFiles.filter(f => !exist.has(f.path));
         return [...prev, ...fresh];
       });
     };
@@ -250,7 +239,7 @@ function App() {
     <div id="App">
       {/* ====== Header ====== */}
       <header className="app-header">
-        <div className="header-icon">NCM Converter</div>
+        <div className="header-icon">Audio Converter</div>
         <div className="header-toolbar">
           <button className="btn btn-primary" onClick={addFiles} disabled={isProcessing}>
             Select Files
@@ -285,6 +274,14 @@ function App() {
         </div>
       )}
 
+      {/* ====== No-FFmpeg notice ====== */}
+      {!ffmpegAvail && (
+        <div className="notice-bar">
+          <span className="notice-icon">&#9432;</span>
+          <span>FFmpeg not found &mdash; transcoding disabled. Only decryption with AUTO format is available. Place ffmpeg.exe in PATH or app directory.</span>
+        </div>
+      )}
+
       {/* ====== Body ====== */}
       <div className="app-body"
         onDragOver={e => { e.preventDefault(); setDragOver(true); }}
@@ -300,7 +297,7 @@ function App() {
 
           {inputs.length === 0 ? (
             <div className="panel-placeholder">
-              <p>Drop <code>.ncm</code> files here</p>
+              <p>Drop audio files here</p>
               <p className="hint">or click Select Files above</p>
             </div>
           ) : (
@@ -312,16 +309,20 @@ function App() {
                     <span className="file-size">{f.size > 0 ? formatSize(f.size) : ''}</span>
                   </div>
                   <div className="input-row-actions">
-                    <select
-                      className="format-select"
-                      value={formatMap.get(f.name) || 'auto'}
-                      onChange={e => setFileFormat(f.name, e.target.value as AudioFormat)}
-                      disabled={isProcessing}
-                    >
-                      {FORMATS.map(fmt => (
-                        <option key={fmt} value={fmt}>{fmt.toUpperCase()}</option>
-                      ))}
-                    </select>
+                    {ffmpegAvail ? (
+                      <select
+                        className="format-select"
+                        value={formatMap.get(f.name) || 'auto'}
+                        onChange={e => setFileFormat(f.name, e.target.value as AudioFormat)}
+                        disabled={isProcessing}
+                      >
+                        {FORMATS.map(fmt => (
+                          <option key={fmt} value={fmt}>{fmt.toUpperCase()}</option>
+                        ))}
+                      </select>
+                    ) : (
+                      <span className="format-auto">AUTO</span>
+                    )}
                     <button
                       className="btn-icon"
                       onClick={() => removeInput(f.path)}
@@ -453,7 +454,7 @@ function App() {
 
       {/* ====== Footer ====== */}
       <footer className="app-footer">
-        <span>Drop .ncm files onto the window</span>
+        <span>Drop audio files onto the window</span>
         {processingName && <span className="now-processing">Now: {processingName}</span>}
         <span className="footer-dir" title={outputDir}>{outputDir}</span>
       </footer>

@@ -2,7 +2,6 @@ package ffmpeg
 
 import (
 	"bufio"
-	_ "embed"
 	"fmt"
 	"math"
 	"os"
@@ -14,26 +13,54 @@ import (
 	"time"
 )
 
-//go:embed ffmpeg.exe
-var ffmpegBinary []byte
+var cachedPath string
 
-var extractedPath string
+// locateFFmpeg 查找 ffmpeg 可执行文件位置
+// 优先 PATH，后备：程序所在目录、当前工作目录
+func locateFFmpeg() (string, error) {
+	if cachedPath != "" {
+		if _, err := os.Stat(cachedPath); err == nil {
+			return cachedPath, nil
+		}
+		cachedPath = ""
+	}
 
-// ensureExtracted 将 ffmpeg.exe 释放到临时目录
-func ensureExtracted() (string, error) {
-	if extractedPath != "" {
-		if _, err := os.Stat(extractedPath); err == nil {
-			return extractedPath, nil
+	// 1. PATH 中查找
+	if p, err := exec.LookPath("ffmpeg"); err == nil {
+		cachedPath = p
+		return p, nil
+	}
+
+	// 2. 程序所在目录
+	if exe, err := os.Executable(); err == nil {
+		dir := filepath.Dir(exe)
+		candidates := []string{
+			filepath.Join(dir, "ffmpeg.exe"),
+			filepath.Join(dir, "ffmpeg"),
+		}
+		for _, p := range candidates {
+			if _, err := os.Stat(p); err == nil {
+				cachedPath = p
+				return p, nil
+			}
 		}
 	}
-	dir := filepath.Join(os.TempDir(), "ncm-converter")
-	os.MkdirAll(dir, 0755)
-	dst := filepath.Join(dir, "ffmpeg.exe")
-	if err := os.WriteFile(dst, ffmpegBinary, 0755); err != nil {
-		return "", fmt.Errorf("释放 ffmpeg 失败: %w", err)
+
+	// 3. 当前工作目录
+	if wd, err := os.Getwd(); err == nil {
+		candidates := []string{
+			filepath.Join(wd, "ffmpeg.exe"),
+			filepath.Join(wd, "ffmpeg"),
+		}
+		for _, p := range candidates {
+			if _, err := os.Stat(p); err == nil {
+				cachedPath = p
+				return p, nil
+			}
+		}
 	}
-	extractedPath = dst
-	return dst, nil
+
+	return "", fmt.Errorf("ffmpeg 未找到。请将其加入 PATH，或放在程序同目录下")
 }
 
 // parseDuration 从 ffmpeg stderr 中提取 Duration 字段（秒）
@@ -66,7 +93,7 @@ func parseTime(line string) float64 {
 // format: "mp3", "flac", "ogg", "wav"
 // onProgress: 进度回调 0~100，可能为 -1 表示未知
 func Transcode(input, output, format string, onProgress func(pct float64)) error {
-	ffpath, err := ensureExtracted()
+	ffpath, err := locateFFmpeg()
 	if err != nil {
 		return err
 	}
@@ -149,8 +176,8 @@ func Transcode(input, output, format string, onProgress func(pct float64)) error
 	return nil
 }
 
-// IsAvailable 返回 ffmpeg 是否已就绪
+// IsAvailable 检查 ffmpeg 是否可用
 func IsAvailable() bool {
-	_, err := ensureExtracted()
+	_, err := locateFFmpeg()
 	return err == nil
 }

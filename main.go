@@ -17,7 +17,7 @@ func main() {
 
 	// Create application with options
 	err := wails.Run(&options.App{
-		Title:  "NCM 音乐解密工具",
+		Title:  "Audio Converter",
 		Width:  1024,
 		Height: 768,
 		AssetServer: &assetserver.Options{

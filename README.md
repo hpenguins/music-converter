@@ -1,39 +1,39 @@
-# NCM Converter
+# Audio Converter
 
-Convert NCM files to standard audio formats (MP3, FLAC, OGG, M4A, WAV).
+Convert audio files between formats and decrypt NCM files to standard audio formats (MP3, FLAC, OGG, WAV).
 
 ## Features
 
-- Select NCM files via file dialog or drag-and-drop
-- Decrypt multiple files in batch with progress indication
+- Select audio files via file dialog or drag-and-drop
+- Decrypt NCM files
+- Transcode between audio formats (requires FFmpeg)
+- Batch conversion with progress indication
 - Choose output directory (defaults to Downloads folder)
 - Click a completed file to preview its metadata and album cover
-- Supports MP3, FLAC, OGG, M4A, WAV output (auto-detected)
+- Settings panel to toggle separate cover file output
 
 ## Usage
 
-1. Click "Select NCM Files" or drag `.ncm` files onto the window
+1. Click "Select Files" or drag audio files onto the window
 2. Choose an output directory (or keep the default Downloads folder)
-3. Click "Start Decrypt"
-4. Click any successfully decrypted row to view details
+3. Select output format per file (when FFmpeg is available)
+4. Click "Start Convert"
+5. Click any successfully converted row to view details
+
+## FFmpeg
+
+For audio transcoding, place `ffmpeg.exe` in the application directory or ensure it is available in your PATH. Without FFmpeg, only decryption of NCM files is supported (AUTO format).
 
 ## Build
 
 ```bash
 git clone <repo-url>
-cd music-converter
-
-# Install frontend dependencies
+cd audio-converter
 cd frontend && npm install && cd ..
-
-# Development mode (hot reload)
-wails dev
-
-# Production build
 wails build
 ```
 
-The executable will be at `build/bin/music-converter.exe`.
+The executable will be at `build/bin/audio-converter.exe`.
 
 ## Requirements
 
