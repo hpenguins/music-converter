@@ -65,7 +65,6 @@ func pkcs7Unpad(data []byte) []byte {
 
 // createKeyBox 生成 Key Box (RC4-like 256字节密钥盒)
 func createKeyBox(keyData []byte) []byte {
-	// KSA
 	S := make([]byte, 256)
 	for i := 0; i < 256; i++ {
 		S[i] = byte(i)
@@ -76,8 +75,6 @@ func createKeyBox(keyData []byte) []byte {
 		j = (j + S[i] + keyData[i%keyLen]) & 0xFF
 		S[i], S[j] = S[j], S[i]
 	}
-
-	// PRGA (JS 映射等效，不改变 S 盒)
 	result := make([]byte, 256)
 	for idx := 0; idx < 256; idx++ {
 		t := byte((idx + 1) & 0xFF)
@@ -117,18 +114,13 @@ func guessAudioFormat(audioData []byte) string {
 // tryParseMetaInfo 尝试解析元数据 JSON
 func tryParseMetaInfo(metaStr string) map[string]interface{} {
 	result := make(map[string]interface{})
-
-	// 处理协议前缀: `music:{...}`, `dj:{...}`
 	colonIdx := strings.Index(metaStr, ":")
 	if colonIdx != -1 {
 		metaStr = metaStr[colonIdx+1:]
 	}
-
 	if err := json.Unmarshal([]byte(metaStr), &result); err != nil {
 		return result
 	}
-
-	// 如果是电台歌曲 (dj:)，使用 mainMusic 子结构
 	if mainMusic, ok := result["mainMusic"].(map[string]interface{}); ok {
 		result = mainMusic
 	}
@@ -167,20 +159,18 @@ func extractArtist(metaInfo map[string]interface{}) string {
 func decryptNCM(data []byte, filename string) (*NCMResult, []byte, error) {
 	offset := 0
 
-	// 1. 验证魔数
 	if len(data) < 8 {
 		return nil, nil, errors.New("文件太小，不是有效的 NCM 文件")
 	}
 	if !bytes.Equal(data[:8], ncmMagic) {
 		return nil, nil, fmt.Errorf("无效的 NCM 文件: 魔数不匹配")
 	}
-	offset += 10 // 8字节魔数 + 2字节保留区
+	offset += 10
 
 	if offset >= len(data) {
 		return nil, nil, errors.New("文件被截断: 魔数后无数据")
 	}
 
-	// 2. 获取并解密 AES 核心密钥
 	keyLength := binary.LittleEndian.Uint32(data[offset:])
 	offset += 4
 
@@ -188,14 +178,12 @@ func decryptNCM(data []byte, filename string) (*NCMResult, []byte, error) {
 		return nil, nil, errors.New("文件被截断: 密钥数据不完整")
 	}
 
-	// XOR 0x64
 	encryptedKey := make([]byte, keyLength)
 	for i := 0; i < int(keyLength); i++ {
 		encryptedKey[i] = data[offset+i] ^ 0x64
 	}
 	offset += int(keyLength)
 
-	// AES-128-ECB 解密
 	block, err := aes.NewCipher(coreKey)
 	if err != nil {
 		return nil, nil, fmt.Errorf("创建 AES 解密器失败: %w", err)
@@ -204,13 +192,11 @@ func decryptNCM(data []byte, filename string) (*NCMResult, []byte, error) {
 	newECBDecrypter(block).CryptBlocks(decryptedKey, encryptedKey)
 	decryptedKey = pkcs7Unpad(decryptedKey)
 
-	// 截取前 17 字节后的内容作为 Key Box 密钥数据
 	if len(decryptedKey) <= 17 {
 		return nil, nil, errors.New("解密后的密钥数据太短")
 	}
 	keyData := decryptedKey[17:]
 
-	// 3. 解析并解密歌曲元数据
 	if offset+4 > len(data) {
 		return nil, nil, errors.New("文件被截断: 元数据长度字段缺失")
 	}
@@ -223,14 +209,12 @@ func decryptNCM(data []byte, filename string) (*NCMResult, []byte, error) {
 			return nil, nil, errors.New("文件被截断: 元数据不完整")
 		}
 
-		// XOR 0x63
 		encryptedMetaRaw := make([]byte, metaLength)
 		for i := 0; i < int(metaLength); i++ {
 			encryptedMetaRaw[i] = data[offset+i] ^ 0x63
 		}
 		offset += int(metaLength)
 
-		// 截取 22 字节之后的部分并进行 Base64 解码
 		if len(encryptedMetaRaw) <= 22 {
 			return nil, nil, errors.New("元数据太短")
 		}
@@ -241,7 +225,6 @@ func decryptNCM(data []byte, filename string) (*NCMResult, []byte, error) {
 			return nil, nil, fmt.Errorf("Base64 解码元数据失败: %w", err)
 		}
 
-		// AES-128-ECB 解密元数据（使用 metaKey）
 		metaBlock, err := aes.NewCipher(metaKey)
 		if err != nil {
 			return nil, nil, fmt.Errorf("创建元数据 AES 解密器失败: %w", err)
@@ -252,10 +235,8 @@ func decryptNCM(data []byte, filename string) (*NCMResult, []byte, error) {
 		metaInfo = tryParseMetaInfo(string(decryptedMeta))
 	}
 
-	// 4. 创建 Key Box
 	keyBox := createKeyBox(keyData)
 
-	// 5. 提取专辑封面图
 	if offset+9 > len(data) {
 		return nil, nil, errors.New("文件被截断: 封面区域缺失")
 	}
@@ -271,14 +252,12 @@ func decryptNCM(data []byte, filename string) (*NCMResult, []byte, error) {
 
 	offset += int(imageLength) + 13
 
-	// 6. 解密音频数据
 	audioEncrypted := data[offset:]
 	audioData := make([]byte, len(audioEncrypted))
 	for i := 0; i < len(audioEncrypted); i++ {
 		audioData[i] = audioEncrypted[i] ^ keyBox[i&0xFF]
 	}
 
-	// 7. 获取音频格式
 	audioFormat := ""
 	if f, ok := metaInfo["format"].(string); ok && f != "" {
 		audioFormat = f
@@ -286,7 +265,6 @@ func decryptNCM(data []byte, filename string) (*NCMResult, []byte, error) {
 		audioFormat = guessAudioFormat(audioData)
 	}
 
-	// 8. 提取元数据字段
 	title := ""
 	if t, ok := metaInfo["musicName"].(string); ok {
 		title = t
@@ -340,7 +318,7 @@ func WriteCoverFile(coverData []byte, audioPath string) string {
 	return coverPath
 }
 
-// synchsafe 将 32 位整数编码为 ID3v2 的 synchsafe 整数（每字节只用 7 位）
+// synchsafe 将 32 位整数编码为 ID3v2 的 synchsafe 整数
 func synchsafe(n int) []byte {
 	return []byte{
 		byte((n >> 21) & 0x7F),
@@ -351,15 +329,12 @@ func synchsafe(n int) []byte {
 }
 
 // embedID3v2 为 MP3 文件写入 ID3v2.3 标签（含专辑封面）
-// 读取整个文件 → 剥离已有 ID3v2 标签 → 写入新标签头+帧 → 追加纯音频数据
 func embedID3v2(audioPath string, title, artist, album string, coverData []byte) error {
-	// 1. 读取整个文件
 	allData, err := os.ReadFile(audioPath)
 	if err != nil {
 		return err
 	}
 
-	// 2. 剥离已有 ID3v2 标签（前 10 字节头 + synchsafe 字段声明的尺寸）
 	dataOffset := 0
 	if len(allData) > 10 && string(allData[:3]) == "ID3" {
 		size := int(allData[6])<<21 | int(allData[7])<<14 | int(allData[8])<<7 | int(allData[9])
@@ -370,14 +345,13 @@ func embedID3v2(audioPath string, title, artist, album string, coverData []byte)
 	}
 	rawAudio := allData[dataOffset:]
 
-	// 3. 构建帧列表
 	type id3Frame struct {
 		id   string
 		data []byte
 	}
 
 	encText := func(s string) []byte {
-		d := []byte{0x03} // UTF-8 编码字节
+		d := []byte{0x03}
 		d = append(d, []byte(s)...)
 		return d
 	}
@@ -394,47 +368,115 @@ func embedID3v2(audioPath string, title, artist, album string, coverData []byte)
 		frames = append(frames, id3Frame{"TALB", encText(album)})
 	}
 	if coverData != nil {
-		// APIC 帧: encoding(1) + mime(N + \0) + picType(1) + desc(\0) + data
-		apic := []byte{0x03} // UTF-8
+		apic := []byte{0x03}
 		apic = append(apic, []byte("image/jpeg")...)
-		apic = append(apic, 0x00) // null terminator
-		apic = append(apic, 0x03) // front cover
-		apic = append(apic, 0x00) // empty description
+		apic = append(apic, 0x00)
+		apic = append(apic, 0x03)
+		apic = append(apic, 0x00)
 		apic = append(apic, coverData...)
 		frames = append(frames, id3Frame{"APIC", apic})
 	}
 
 	if len(frames) == 0 {
-		return nil // 无标签可写，不修改文件
+		return nil
 	}
 
-	// 4. 计算 ID3v2 标签总大小（帧头 10 + 帧数据）
 	frameSize := 0
 	for _, fr := range frames {
 		frameSize += 10 + len(fr.data)
 	}
 
-	// 5. 构建 ID3v2 头: "ID3" + ver(3,0) + flags(0) + synchsafe size
 	tagHeader := []byte("ID3")
-	tagHeader = append(tagHeader, 0x03, 0x00) // v2.3
-	tagHeader = append(tagHeader, 0x00)       // flags
+	tagHeader = append(tagHeader, 0x03, 0x00)
+	tagHeader = append(tagHeader, 0x00)
 	tagHeader = append(tagHeader, synchsafe(frameSize)...)
 
-	// 6. 构建完整标签帧
 	var tagFrames []byte
 	for _, fr := range frames {
-		// 帧头: id(4) + size(4) + flags(2)
 		fh := []byte(fr.id)
 		fh = append(fh, byte(len(fr.data)>>24), byte(len(fr.data)>>16), byte(len(fr.data)>>8), byte(len(fr.data)))
-		fh = append(fh, 0x00, 0x00) // no flags
+		fh = append(fh, 0x00, 0x00)
 		tagFrames = append(tagFrames, fh...)
 		tagFrames = append(tagFrames, fr.data...)
 	}
 
-	// 7. 以截断方式写回文件：标签头 + 帧数据 + 纯音频
 	out := append(tagHeader, tagFrames...)
 	out = append(out, rawAudio...)
 	return os.WriteFile(audioPath, out, 0644)
+}
+
+// embedFLACPicture 向 FLAC 文件写入封面图片（METADATA_BLOCK_PICTURE）
+func embedFLACPicture(audioPath string, coverData []byte) error {
+	if coverData == nil {
+		return nil
+	}
+
+	data, err := os.ReadFile(audioPath)
+	if err != nil {
+		return err
+	}
+
+	if len(data) < 4 || string(data[:4]) != "fLaC" {
+		return fmt.Errorf("不是有效的 FLAC 文件")
+	}
+
+	pos := 4
+	for pos < len(data) {
+		if pos+4 > len(data) {
+			return fmt.Errorf("FLAC 文件截断")
+		}
+		isLast := (data[pos] & 0x80) != 0
+		blockLen := int(data[pos+1])<<16 | int(data[pos+2])<<8 | int(data[pos+3])
+		blockEnd := pos + 4 + blockLen
+		if blockEnd > len(data) {
+			return fmt.Errorf("FLAC 元数据块截断")
+		}
+		if isLast {
+			// 清除原最后标记
+			data[pos] &^= 0x80
+
+			// 构建 PICTURE 块
+			picData := buildFLACPictureBlock(coverData)
+			if picData == nil {
+				return nil
+			}
+
+			picHeader := []byte{0x80 | 6} // is_last, type=6 PICTURE
+			picHeader = append(picHeader, byte(len(picData)>>16), byte(len(picData)>>8), byte(len(picData)))
+
+			out := make([]byte, 0, blockEnd+len(picHeader)+len(picData)+len(data)-blockEnd)
+			out = append(out, data[:blockEnd]...)
+			out = append(out, picHeader...)
+			out = append(out, picData...)
+			out = append(out, data[blockEnd:]...)
+			return os.WriteFile(audioPath, out, 0644)
+		}
+		pos += 4 + blockLen
+	}
+	return fmt.Errorf("FLAC 文件中未找到元数据块结束标记")
+}
+
+// buildFLACPictureBlock 构建 FLAC PICTURE 元数据块内容
+func buildFLACPictureBlock(coverData []byte) []byte {
+	if len(coverData) == 0 {
+		return nil
+	}
+
+	var b []byte
+	// picture type: 3 (front cover)
+	b = append(b, 0, 0, 0, 3)
+	// mime string length
+	mime := "image/jpeg"
+	b = append(b, byte(len(mime)>>24), byte(len(mime)>>16), byte(len(mime)>>8), byte(len(mime)))
+	b = append(b, []byte(mime)...)
+	// description length = 0
+	b = append(b, 0, 0, 0, 0)
+	// width, height, depth, colors = 0
+	b = append(b, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+	// picture data length
+	b = append(b, byte(len(coverData)>>24), byte(len(coverData)>>16), byte(len(coverData)>>8), byte(len(coverData)))
+	b = append(b, coverData...)
+	return b
 }
 
 // EmbedMetadata 将元数据和封面内嵌到音频文件中
@@ -444,9 +486,7 @@ func EmbedMetadata(audioPath, title, artist, album string, coverData []byte) err
 	case ".mp3":
 		return embedID3v2(audioPath, title, artist, album, coverData)
 	case ".flac":
-		// FLAC 元数据块嵌入较复杂，暂用外部文件替代
-		// 可后续扩展
-		return nil
+		return embedFLACPicture(audioPath, coverData)
 	default:
 		return nil
 	}

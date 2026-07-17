@@ -34,15 +34,12 @@ func settingsPath() string {
 
 // loadSettings 从磁盘加载设置
 func loadSettings() AppSettings {
-	s := AppSettings{SaveCoverFile: true} // 默认值
+	s := AppSettings{SaveCoverFile: true}
 	data, err := os.ReadFile(settingsPath())
 	if err != nil {
 		return s
 	}
 	json.Unmarshal(data, &s)
-	if data == nil {
-		s.SaveCoverFile = true
-	}
 	return s
 }
 
@@ -65,8 +62,6 @@ func NewApp() *App {
 // startup 应用启动时调用
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
-
-	// 注册文件拖拽事件
 	runtime.OnFileDrop(ctx, func(x, y int, paths []string) {
 		if len(paths) == 0 {
 			return
@@ -115,7 +110,7 @@ type FileConvertRequest struct {
 	Format string `json:"format"` // "auto", "mp3", "flac", "ogg", "wav"
 }
 
-// SelectNCMFiles 打开文件选择对话框，支持常见音频格式
+// SelectNCMFiles 打开文件选择对话框
 func (a *App) SelectNCMFiles() ([]FileInfo, error) {
 	files, err := runtime.OpenMultipleFilesDialog(a.ctx, runtime.OpenDialogOptions{
 		Title: "选择音频文件",
@@ -214,13 +209,11 @@ func isNCM(path string) bool {
 	return strings.ToLower(filepath.Ext(path)) == ".ncm"
 }
 
-// audioExt 支持的音频扩展名列表
-var audioExts = []string{".ncm", ".mp3", ".flac", ".ogg", ".wav", ".m4a", ".wma", ".aac", ".opus"}
-
 // isSupportedAudio 判断是否为支持的音频文件
 func isSupportedAudio(path string) bool {
 	ext := strings.ToLower(filepath.Ext(path))
-	for _, e := range audioExts {
+	supported := []string{".ncm", ".mp3", ".flac", ".ogg", ".wav", ".m4a", ".wma", ".aac", ".opus"}
+	for _, e := range supported {
 		if ext == e {
 			return true
 		}
@@ -245,17 +238,15 @@ func (a *App) ConvertFiles(requests []FileConvertRequest, outputDir string) ([]D
 		fileName := filepath.Base(filePath)
 		targetFormat := strings.ToLower(req.Format)
 
-		// 确定输出格式
 		if targetFormat == "" || targetFormat == "auto" {
-			// auto 模式：NCM 用解密检测的格式，其他保留原格式
 			if isNCM(filePath) {
-				targetFormat = "detect" // 后面解密后确定
+				targetFormat = "detect"
 			} else {
 				ext := strings.TrimPrefix(strings.ToLower(filepath.Ext(filePath)), ".")
 				if ext == "m4a" || ext == "wma" || ext == "aac" || ext == "opus" {
-					targetFormat = "mp3" // 这类默认转 MP3
+					targetFormat = "mp3"
 				} else {
-					targetFormat = ext // 保持原格式 = 不转码
+					targetFormat = ext
 				}
 			}
 		}
@@ -263,14 +254,12 @@ func (a *App) ConvertFiles(requests []FileConvertRequest, outputDir string) ([]D
 		results[i] = DecryptStatus{FileName: fileName, FilePath: filePath, Status: "processing"}
 
 		if isNCM(filePath) {
-			// ===== NCM 路径：解密 + 可选转码 =====
 			err := a.convertNCM(i, total, req, targetFormat, outputDir, &results[i])
 			if err != nil {
 				results[i].Status = "error"
 				results[i].Error = err.Error()
 			}
 		} else {
-			// ===== 普通音频路径：直接 ffmpeg 转码 =====
 			err := a.convertAudio(i, total, req, targetFormat, outputDir, &results[i])
 			if err != nil {
 				results[i].Status = "error"
@@ -278,7 +267,6 @@ func (a *App) ConvertFiles(requests []FileConvertRequest, outputDir string) ([]D
 			}
 		}
 
-		// 发送最终事件
 		runtime.EventsEmit(a.ctx, "convert:progress", map[string]interface{}{
 			"current":   i + 1,
 			"total":     total,
@@ -288,6 +276,7 @@ func (a *App) ConvertFiles(requests []FileConvertRequest, outputDir string) ([]D
 			"output":    results[i].Output,
 			"title":     results[i].Title,
 			"artist":    results[i].Artist,
+				"album":     results[i].Album,
 			"format":    results[i].Format,
 			"coverPath": results[i].CoverPath,
 		})
@@ -305,13 +294,11 @@ func (a *App) convertNCM(idx, total int, req FileConvertRequest, targetFormat, o
 		"current": idx, "total": total, "fileName": fileName, "status": "decrypting",
 	})
 
-	// 解密
 	result, audioData, err := DecryptToBuffer(filePath)
 	if err != nil {
 		return fmt.Errorf("解密失败: %w", err)
 	}
 
-	// auto 检测模式下使用解密检测到的格式
 	if targetFormat == "detect" {
 		targetFormat = result.Format
 	}
@@ -322,16 +309,16 @@ func (a *App) convertNCM(idx, total int, req FileConvertRequest, targetFormat, o
 	outPath := filepath.Join(outputDir, outName)
 
 	if needTranscode {
-		// 写临时文件
 		tmpDir := filepath.Join(os.TempDir(), "ncm-converter")
 		os.MkdirAll(tmpDir, 0755)
 		tmpFile := filepath.Join(tmpDir, baseName+"."+result.Format)
 		if err := os.WriteFile(tmpFile, audioData, 0644); err != nil {
 			return fmt.Errorf("写临时文件失败: %w", err)
 		}
-		EmbedMetadata(tmpFile, result.Title, result.Artist, result.Album, result.CoverData)
+		if err := EmbedMetadata(tmpFile, result.Title, result.Artist, result.Album, result.CoverData); err != nil {
+			fmt.Printf("嵌入临时文件元数据失败: %v\n", err)
+		}
 
-		// 转码
 		runtime.EventsEmit(a.ctx, "convert:progress", map[string]interface{}{
 			"current": idx, "total": total, "fileName": fileName, "status": "transcoding",
 		})
@@ -345,17 +332,18 @@ func (a *App) convertNCM(idx, total int, req FileConvertRequest, targetFormat, o
 			return fmt.Errorf("转码失败: %w", tErr)
 		}
 
-		// 重新嵌入元数据
-		EmbedMetadata(outPath, result.Title, result.Artist, result.Album, result.CoverData)
+		if err := EmbedMetadata(outPath, result.Title, result.Artist, result.Album, result.CoverData); err != nil {
+			fmt.Printf("嵌入元数据失败: %v\n", err)
+		}
 	} else {
-		// 直接写
 		if err := WriteAudioFile(outPath, audioData); err != nil {
 			return fmt.Errorf("写入文件失败: %w", err)
 		}
-		EmbedMetadata(outPath, result.Title, result.Artist, result.Album, result.CoverData)
+		if err := EmbedMetadata(outPath, result.Title, result.Artist, result.Album, result.CoverData); err != nil {
+			fmt.Printf("嵌入元数据失败: %v\n", err)
+		}
 	}
 
-	// 封面
 	coverPath := ""
 	if a.settings.SaveCoverFile && result.CoverData != nil {
 		coverPath = WriteCoverFile(result.CoverData, outPath)
@@ -384,7 +372,6 @@ func (a *App) convertAudio(idx, total int, req FileConvertRequest, targetFormat,
 	outName := baseName + "." + targetFormat
 	outPath := filepath.Join(outputDir, outName)
 
-	// 源格式 == 目标格式 → 直接复制（不转码）
 	srcExt := strings.TrimPrefix(strings.ToLower(filepath.Ext(filePath)), ".")
 	if srcExt == targetFormat {
 		inputData, err := os.ReadFile(filePath)
@@ -395,7 +382,6 @@ func (a *App) convertAudio(idx, total int, req FileConvertRequest, targetFormat,
 			return fmt.Errorf("写入文件失败: %w", err)
 		}
 	} else {
-		// ffmpeg 转码（保留源文件元数据）
 		tErr := ffmpeg.Transcode(filePath, outPath, targetFormat, func(pct float64) {
 			runtime.EventsEmit(a.ctx, "convert:progress", map[string]interface{}{
 				"current": idx, "total": total, "fileName": fileName, "status": "transcoding", "transPct": pct,
